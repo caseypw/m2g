@@ -271,6 +271,29 @@ class DmriReg:
         print("Extracting white matter edge...")
         gen_utils.run(cmd)
 
+    def check_gen_tissue_files(self):
+        """Function for checking whether files were resliced or not.
+        Only used for `skipreg` option."""
+
+        if self.vox_size == "1mm":
+            new_zooms = (1.0, 1.0, 1.0)
+        elif self.vox_size == "2mm":
+            new_zooms = (2.0, 2.0, 2.0)
+
+        img = nib.load(self.t1w_brain)
+        zooms = img.header.get_zooms()[:3]
+
+        if (abs(zooms[0]), abs(zooms[1]), abs(zooms[2])) != new_zooms:
+            suffix = "_res.nii.gz"
+        else:
+            suffix = "_nores.nii.gz"
+
+        # Remove .nii.gz and replace with suffix
+        self.t1w_brain = self.t1w_brain[:-7] + suffix
+        self.wm_mask = self.wm_mask[:-7] + suffix
+        self.gm_mask = self.gm_mask[:-7] + suffix
+        self.csf_mask = self.csf_mask[:-7] + suffix
+
     @gen_utils.timer
     def t1w2dwi_align(self):
         """Alignment from t1w to mni, making t1w_mni, and t1w_mni to dwi. A function to perform self alignment. Uses a local optimisation cost function to get the

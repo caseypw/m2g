@@ -14,6 +14,7 @@ import os
 import time
 import csv
 from itertools import combinations
+from functools import reduce
 from collections import defaultdict
 from pathlib import Path
 
@@ -24,6 +25,7 @@ import nibabel as nib
 from dipy.tracking._utils import _mapping_to_voxel, _to_voxel_coordinates
 from m2g.utils.gen_utils import timer
 import matplotlib
+from joblib import Parallel, delayed
 
 matplotlib.use("agg")
 from matplotlib import pyplot as plt
@@ -36,8 +38,8 @@ class GraphTools:
 
     Parameters
     ----------
-    rois : str
-        Path to a set of ROIs as either an array or nifti file
+    rois : ndarray
+        ROIs as array
     tracks : list
         Streamlines for analysis
     affine : ndarray
@@ -50,6 +52,8 @@ class GraphTools:
         Path to atlas before registration. By default None
     sens : str, optional, DEPRACATED
         type of MRI scan being analyzed (can be 'dwi' or 'func'), by default "dwi"
+    n_cpus : int, optional
+        Number of cpus to use when computing the edges
 
     Raises
     ------
@@ -60,21 +64,30 @@ class GraphTools:
     """
 
     def __init__(
-        self, rois, tracks, affine, outdir, connectome_path, attr=None, sens="dwi"
+        self,
+        rois,
+        tracks,
+        affine,
+        outdir,
+        connectome_path,
+        attr=None,
+        sens="dwi",
+        n_cpus=1,
     ):
 
         self.edge_dict = defaultdict(int)
         self.roi_file = rois
         self.roi_img = nib.load(self.roi_file)
-        self.rois = self.roi_img.get_data().astype("int")
-        self.n_ids = self.rois[self.rois > 0]
-        self.N = len(self.n_ids)
+        #self.rois = self.roi_img.get_data().astype("int")
+        #self.n_ids = self.rois[self.rois > 0]
+        #self.N = len(self.n_ids)
         self.modal = sens
         self.tracks = tracks
         self.affine = affine
         self.outdir = outdir
         self.connectome_path = os.path.dirname(connectome_path)
         self.attr = attr
+        self.n_cpus = int(n_cpus)
 
     @timer
     def make_graph_old(self):
@@ -158,8 +171,8 @@ class GraphTools:
         self.attr = self.attr.get_data().astype("int")
                 
         mx = len(np.unique(self.attr.astype(np.int64)))
-        self.g = nx.Graph(ecount=0, vcount=mx)
-        edge_dict = defaultdict(int)
+        #self.g = nx.Graph(ecount=0, vcount=mx)
+        #edge_dict = defaultdict(int)
         #node_dict = dict(
         #    zip(np.unique(self.rois).astype("int16") + 1, np.arange(mx) + 1)
         #)
@@ -180,14 +193,39 @@ class GraphTools:
 
 
         # Add empty vertices
-        for node in range(0,mx):#(1, mx + 1):
-            self.g.add_node(node)
+        #for node in range(0,mx):#(1, mx + 1):
+        #    self.g.add_node(node)
 
-        nlines = np.shape(self.tracks)[0]
+        nlines = len(self.tracks)
         print("# of Streamlines: " + str(nlines))
 
-        ix = 0
-        for s in self.tracks:
+        def worker(tracks):
+            g = nx.Graph(ecount=0, vcount=mx - 1)
+            # Add empty vertices
+            nodelist = list(range(1, mx))
+            for node in nodelist:  # (1, mx + 1):
+                g.add_node(node)
+
+            edge_dict = defaultdict(int)
+            for s in tracks:
+                points = _to_voxel_coordinates(s, lin_T, offset)
+
+                # get labels for label_volume
+                i, j, k = points.T
+
+                lab_arr = self.rois[i, j, k]
+                endlabels = []
+                for lab in np.unique(lab_arr).astype("int16"):
+                    if (lab > 0) and (np.sum(lab_arr == lab) >= overlap_thr):
+                        endlabels.append(node_dict[lab])
+                endlabels = sorted(endlabels)
+
+                edges = combinations(endlabels, 2)
+                for edge in edges:
+                    edge_dict[edge] += 1
+
+        #ix = 0
+        #for s in self.tracks:
             # Map the streamlines coordinates to voxel coordinates and get labels for label_volume
             # i, j, k = np.vstack(np.array([get_sphere(coord, error_margin,
             #                                          (voxel_size, voxel_size, voxel_size),
@@ -195,31 +233,40 @@ class GraphTools:
             #                               _to_voxel_coordinates(s, lin_T, offset)])).T
 
             # Map the streamlines coordinates to voxel coordinates
-            points = _to_voxel_coordinates(s, lin_T, offset)
+        #    points = _to_voxel_coordinates(s, lin_T, offset)
 
             # get labels for label_volume
-            i, j, k = points.T
+        #    i, j, k = points.T
 
-            lab_arr = self.rois[i, j, k]
-            endlabels = []
-            for lab in np.unique(lab_arr).astype("int16"):
-                if (lab > 0) and (np.sum(lab_arr == lab) >= overlap_thr):
-                    endlabels.append(node_dict[lab])
+        #    lab_arr = self.rois[i, j, k]
+        #    endlabels = []
+        #    for lab in np.unique(lab_arr).astype("int16"):
+        #        if (lab > 0) and (np.sum(lab_arr == lab) >= overlap_thr):
+        #            endlabels.append(node_dict[lab])
 
-            edges = combinations(endlabels, 2)
-            for edge in edges:
-                lst = tuple([int(node) for node in edge])
-                edge_dict[tuple(sorted(lst))] += 1
+        #    edges = combinations(endlabels, 2)
+        #    for edge in edges:
+        #        lst = tuple([int(node) for node in edge])
+        #        edge_dict[tuple(sorted(lst))] += 1
 
             edge_list = [(k[0], k[1], v) for k, v in edge_dict.items()]
+            g.add_weighted_edges_from(edge_list)
+            A = nx.to_numpy_array(g, nodelist=nodelist)
+            return A
 
-            self.g.add_weighted_edges_from(edge_list)
-            ix = ix + 1
+        res = Parallel(n_jobs=self.n_cpus)(
+            delayed(worker)(self.tracks[start :: self.n_cpus])
+            for start in range(self.n_cpus)
+        )
+        conn_matrix = reduce(np.add, res)
 
-        conn_matrix = np.array(nx.to_numpy_matrix(self.g))
-        conn_matrix[np.isnan(conn_matrix)] = 0
-        conn_matrix[np.isinf(conn_matrix)] = 0
-        conn_matrix = np.asmatrix(np.maximum(conn_matrix, conn_matrix.transpose()))
+        #    self.g.add_weighted_edges_from(edge_list)
+        #    ix = ix + 1
+
+        #conn_matrix = np.array(nx.to_numpy_matrix(self.g))
+        #conn_matrix[np.isnan(conn_matrix)] = 0
+        #conn_matrix[np.isinf(conn_matrix)] = 0
+        #conn_matrix = np.asmatrix(np.maximum(conn_matrix, conn_matrix.transpose()))
         g = nx.from_numpy_matrix(conn_matrix)
 
         return g
